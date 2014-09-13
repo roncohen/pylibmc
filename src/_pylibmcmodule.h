@@ -130,7 +130,7 @@ typedef struct {
 } _PylibMC_StatsContext;
 
 /* {{{ Exceptions */
-static PyObject *PylibMCExc_MemcachedError;
+static PyObject *PylibMCExc_Error;
 
 /* Mapping of memcached_return value -> Python exception object. */
 typedef struct {
@@ -311,8 +311,8 @@ static PyObject *PylibMC_ErrFromMemcached(PylibMC_Client *, const char *,
         memcached_return);
 static PyObject *_PylibMC_Unpickle(const char *, size_t);
 static PyObject *_PylibMC_Pickle(PyObject *);
-static int _PylibMC_CheckKey(PyObject *);
-static int _PylibMC_CheckKeyStringAndSize(char *, Py_ssize_t);
+static int _key_normalized_obj(PyObject **);
+static int _key_normalized_str(char **, Py_ssize_t *);
 static int _PylibMC_SerializeValue(PyObject *key_obj,
                                    PyObject *key_prefix,
                                    PyObject *value_obj,
