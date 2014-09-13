@@ -3,21 +3,21 @@
  *
  * Copyright (c) 2008, Ludvig Ericson
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
- * 
+ *
  *  - Redistributions of source code must retain the above copyright notice,
  *  this list of conditions and the following disclaimer.
- * 
+ *
  *  - Redistributions in binary form must reproduce the above copyright notice,
  *  this list of conditions and the following disclaimer in the documentation
  *  and/or other materials provided with the distribution.
- * 
+ *
  *  - Neither the name of the author nor the names of the contributors may be
  *  used to endorse or promote products derived from this software without
  *  specific prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -35,9 +35,9 @@
 #ifdef USE_ZLIB
 #  include <zlib.h>
 #  define ZLIB_BUFSZ (1 << 14)
-/* only callable while holding the GIL */
-#  define _ZLIB_ERR(s, rc) \
-  PyErr_Format(PylibMCExc_MemcachedError, "zlib error %d in " s, rc);
+/* only release the GIL during inflate if the size of the data
+   is greater than this (deflate always releases at present) */
+#  define ZLIB_GIL_RELEASE ZLIB_BUFSZ
 #endif
 
 #define PyBool_TEST(t) ((t) ? Py_True : Py_False)
@@ -45,6 +45,44 @@
 #define PyModule_ADD_REF(mod, nam, obj) \
     { Py_INCREF(obj); \
       PyModule_AddObject(mod, nam, obj); }
+
+
+/* Some Python 3 porting stuff */
+#ifndef Py_TYPE
+#define Py_TYPE(ob) (((PyObject*)(ob))->ob_type)
+#endif
+#ifndef PyInt_Check
+#define PyInt_Check PyLong_Check
+#endif
+
+#if PY_MAJOR_VERSION >= 3
+#define MOD_ERROR_VAL NULL
+#define MOD_SUCCESS_VAL(val) val
+#define MOD_INIT(name) PyMODINIT_FUNC PyInit_##name(void)
+#define MOD_DEF(ob, name, doc, methods)                     \
+    static struct PyModuleDef moduledef = {                 \
+        PyModuleDef_HEAD_INIT, name, doc, -1, methods, };   \
+    ob = PyModule_Create(&moduledef);
+#else
+#define MOD_ERROR_VAL
+#define MOD_SUCCESS_VAL(val)
+#define MOD_INIT(name) void init##name(void)
+#define MOD_DEF(ob, name, doc, methods)         \
+    ob = Py_InitModule3(name, methods, doc);
+#define PyBytes_AS_STRING PyString_AS_STRING
+#define PyBytes_AsStringAndSize PyString_AsStringAndSize
+#define PyBytes_Check PyString_Check
+#define PyBytes_Concat PyString_Concat
+#define PyBytes_FromFormat PyString_FromFormat
+#define PyBytes_FromString PyString_FromString
+#define PyBytes_FromStringAndSize PyString_FromStringAndSize
+#define PyBytes_GET_SIZE PyString_GET_SIZE
+#define PyBytes_Size PyString_Size
+#define PyLong_AS_LONG PyInt_AS_LONG
+#define PyNumber_Long PyNumber_Int
+#define _PyBytes_Resize _PyString_Resize
+#define PyObject_Bytes PyObject_Str
+#endif
 
 
 /* {{{ Type methods */
@@ -74,7 +112,7 @@ static void PylibMC_ClientType_dealloc(PylibMC_Client *self) {
         memcached_free(self->mc);
     }
 
-    self->ob_type->tp_free(self);
+    Py_TYPE(self)->tp_free(self);
 }
 /* }}} */
 
@@ -83,12 +121,15 @@ static int PylibMC_Client_init(PylibMC_Client *self, PyObject *args,
     PyObject *srvs, *srvs_it, *c_srv;
     unsigned char set_stype = 0, bin = 0, got_server = 0;
     const char *user = NULL, *pass = NULL;
+    PyObject *behaviors = NULL;
     memcached_return rc;
 
-    static char *kws[] = { "servers", "binary", "username", "password", NULL };
+    static char *kws[] = { "servers", "binary", "username", "password",
+                           "behaviors", NULL };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|bzz", kws,
-                                     &srvs, &bin, &user, &pass)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|bzzO", kws,
+                                     &srvs, &bin, &user, &pass,
+                                     &behaviors)) {
         return -1;
     }
 
@@ -133,6 +174,12 @@ static int PylibMC_Client_init(PylibMC_Client *self, PyObject *args,
         goto error;
     }
 
+    if (behaviors != NULL) {
+        if (PylibMC_Client_set_behaviors(self, behaviors) == NULL) {
+            goto error;
+        }
+    }
+
     while ((c_srv = PyIter_Next(srvs_it)) != NULL) {
         unsigned char stype;
         char *hostname;
@@ -142,12 +189,12 @@ static int PylibMC_Client_init(PylibMC_Client *self, PyObject *args,
         got_server |= 1;
         port = 0;
         weight = 1;
-        if (PyString_Check(c_srv)) {
+        if (PyBytes_Check(c_srv)) {
             memcached_server_st *list;
 
-            list = memcached_servers_parse(PyString_AS_STRING(c_srv));
+            list = memcached_servers_parse(PyBytes_AS_STRING(c_srv));
             if (list == NULL) {
-                PyErr_SetString(PylibMCExc_MemcachedError,
+                PyErr_SetString(PylibMCExc_Error,
                         "memcached_servers_parse returned NULL");
                 goto it_error;
             }
@@ -174,11 +221,13 @@ static int PylibMC_Client_init(PylibMC_Client *self, PyObject *args,
             }
 
             switch (stype) {
+                case PYLIBMC_SERVER_UDP:
+#if LIBMEMCACHED_VERSION_HEX <= 0x00053000
+                    rc = memcached_server_add_udp_with_weight(self->mc, hostname, port, weight);
+                    break;
+#endif
                 case PYLIBMC_SERVER_TCP:
                     rc = memcached_server_add_with_weight(self->mc, hostname, port, weight);
-                    break;
-                case PYLIBMC_SERVER_UDP:
-                    rc = memcached_server_add_udp_with_weight(self->mc, hostname, port, weight);
                     break;
                 case PYLIBMC_SERVER_UNIX:
                     if (port) {
@@ -206,7 +255,7 @@ it_error:
     }
 
     if (!got_server) {
-        PyErr_SetString(PylibMCExc_MemcachedError, "empty server list");
+        PyErr_SetString(PylibMCExc_Error, "empty server list");
         goto error;
     }
 
@@ -220,16 +269,21 @@ error:
 /* {{{ Compression helpers */
 #ifdef USE_ZLIB
 static int _PylibMC_Deflate(char *value, size_t value_len,
-                    char **result, size_t *result_len) {
+                    char **result, size_t *result_len,
+                    int compress_level) {
     /* FIXME Failures are entirely silent. */
     int rc;
 
+    /* n.b.: this is called wiile *not* holding the GIL, and must not
+       contain Python-API code */
+
+    ssize_t out_sz;
     z_stream strm;
     *result = NULL;
     *result_len = 0;
 
     /* Don't ask me about this one. Got it from zlibmodule.c in Python 2.6. */
-    ssize_t out_sz = value_len + value_len / 1000 + 12 + 1;
+    out_sz = value_len + value_len / 1000 + 12 + 1;
 
     if ((*result = malloc(out_sz)) == NULL) {
       goto error;
@@ -248,17 +302,13 @@ static int _PylibMC_Deflate(char *value, size_t value_len,
     strm.zalloc = (alloc_func)NULL;
     strm.zfree = (free_func)Z_NULL;
 
-    /* TODO Expose compression level somehow. */
-    if (deflateInit((z_streamp)&strm, Z_BEST_SPEED) != Z_OK) {
+    if (deflateInit((z_streamp)&strm, compress_level) != Z_OK) {
         goto error;
     }
 
-    Py_BEGIN_ALLOW_THREADS;
     rc = deflate((z_streamp)&strm, Z_FINISH);
-    Py_END_ALLOW_THREADS;
 
     if (rc != Z_STREAM_END) {
-        _ZLIB_ERR("deflate", rc);
         goto error;
     }
 
@@ -287,20 +337,30 @@ error:
     return 0;
 }
 
-static PyObject *_PylibMC_Inflate(char *value, size_t size) {
+static int _PylibMC_Inflate(char *value, size_t size,
+                            char** result, size_t* result_size,
+                            char** failure_reason) {
+
+    /*
+       can be called while not holding the GIL. returns the zlib return value,
+       returns the size of the inflated data in *result_size and the data itself
+       in *result, and the failed call in failure_reason if appropriate
+
+       while deflate can silently ignore errors, we can't
+    */
+
     int rc;
-    char *out;
-    PyObject *out_obj;
-    Py_ssize_t rvalsz;
+    char* out = NULL;
+    char* tryrealloc = NULL;
     z_stream strm;
 
     /* Output buffer */
-    rvalsz = ZLIB_BUFSZ;
-    out_obj = PyString_FromStringAndSize(NULL, rvalsz);
-    if (out_obj == NULL) {
-        return NULL;
+    size_t rvalsz = ZLIB_BUFSZ;
+    out = malloc(ZLIB_BUFSZ);
+
+    if(out == NULL) {
+        return Z_MEM_ERROR;
     }
-    out = PyString_AS_STRING(out_obj);
 
     /* TODO 64-bit fix size/rvalsz */
     assert(size < 0xffffffffU);
@@ -309,22 +369,22 @@ static PyObject *_PylibMC_Inflate(char *value, size_t size) {
     /* Set up zlib stream. */
     strm.avail_in = (uInt)size;
     strm.avail_out = (uInt)rvalsz;
-    strm.next_in = (Byte *)value;
-    strm.next_out = (Byte *)out;
+    strm.next_in = (Byte*)value;
+    strm.next_out = (Byte*)out;
 
     strm.zalloc = (alloc_func)NULL;
     strm.zfree = (free_func)Z_NULL;
+    strm.opaque = (voidpf)NULL;
 
     /* TODO Add controlling of windowBits with inflateInit2? */
     if ((rc = inflateInit((z_streamp)&strm)) != Z_OK) {
-        _ZLIB_ERR("inflateInit", rc);
+        *failure_reason = "inflateInit";
         goto error;
     }
 
     do {
-        Py_BEGIN_ALLOW_THREADS;
+        *failure_reason = "inflate";
         rc = inflate((z_streamp)&strm, Z_FINISH);
-        Py_END_ALLOW_THREADS;
 
         switch (rc) {
         case Z_STREAM_END:
@@ -333,38 +393,60 @@ static PyObject *_PylibMC_Inflate(char *value, size_t size) {
          * This is also true for Z_OK, hence the fall-through. */
         case Z_BUF_ERROR:
             if (strm.avail_out) {
-                _ZLIB_ERR("inflate", rc);
-                inflateEnd(&strm);
-                goto error;
+                goto zerror;
             }
         /* Fall-through */
         case Z_OK:
-            if (_PyString_Resize(&out_obj, (Py_ssize_t)(rvalsz << 1)) < 0) {
-                inflateEnd(&strm);
-                goto error;
+            if((tryrealloc = realloc(out, rvalsz << 1)) == NULL || errno == ENOMEM) {
+                *failure_reason = "realloc";
+                rc = Z_MEM_ERROR;
+                goto zerror;
             }
+
+            out = tryrealloc;
+
             /* Wind forward */
-            out = PyString_AS_STRING(out_obj);
-            strm.next_out = (Byte *)(out + rvalsz);
-            strm.avail_out = (uInt)rvalsz;
+
+            strm.next_out = (unsigned char*)(out + rvalsz);
+            strm.avail_out = rvalsz;
             rvalsz = rvalsz << 1;
             break;
         default:
-            inflateEnd(&strm);
-            goto error;
+            goto zerror;
         }
+
     } while (rc != Z_STREAM_END);
 
     if ((rc = inflateEnd(&strm)) != Z_OK) {
-        _ZLIB_ERR("inflateEnd", rc);
+        *failure_reason = "inflateEnd";
         goto error;
     }
 
-    _PyString_Resize(&out_obj, strm.total_out);
-    return out_obj;
+    tryrealloc = realloc(out, strm.total_out);
+
+    if(tryrealloc == NULL || errno == ENOMEM) {
+        /* we failed to *shrink* the value? */
+        *failure_reason = "realloc";
+        rc = Z_MEM_ERROR;
+        goto error;
+    }
+
+    out = tryrealloc;
+
+    *result = out;
+    *result_size = strm.total_out;
+
+    return Z_OK;
+
+zerror:
+    inflateEnd(&strm);
+
 error:
-    Py_DECREF(out_obj);
-    return NULL;
+    if(out != NULL) {
+        free(out);
+    }
+    *result = NULL;
+    return rc;
 }
 #endif
 /* }}} */
@@ -380,15 +462,50 @@ static PyObject *_PylibMC_parse_memcached_value(char *value, size_t size,
 
     /* Decompress value if necessary. */
     if (flags & PYLIBMC_FLAG_ZLIB) {
-        if ((inflated = _PylibMC_Inflate(value, size)) == NULL) {
+        int rc;
+        char* inflated_buf = NULL;
+        size_t inflated_size = 0;
+        char* failure_reason = NULL;
+
+        if(size >= ZLIB_GIL_RELEASE) {
+            Py_BEGIN_ALLOW_THREADS;
+            rc = _PylibMC_Inflate(value, size,
+                                  &inflated_buf, &inflated_size,
+                                  &failure_reason);
+            Py_END_ALLOW_THREADS;
+        } else {
+            rc = _PylibMC_Inflate(value, size,
+                                  &inflated_buf, &inflated_size,
+                                  &failure_reason);
+        }
+
+        if(rc != Z_OK) {
+            /* set up the exception */
+            if(failure_reason == NULL) {
+                PyErr_Format(PylibMCExc_Error,
+                             "Failed to decompress value: %d", rc);
+            } else {
+                PyErr_Format(PylibMCExc_Error,
+                             "Failed to decompress value: %s", failure_reason);
+            }
             return NULL;
         }
-        value = PyString_AS_STRING(inflated);
-        size = PyString_GET_SIZE(inflated);
+
+        inflated = PyBytes_FromStringAndSize(inflated_buf, inflated_size);
+
+        free(inflated_buf);
+
+        if(inflated == NULL) {
+            return NULL;
+        }
+
+        value = PyBytes_AS_STRING(inflated);
+        size = PyBytes_GET_SIZE(inflated);
     }
+
 #else
     if (flags & PYLIBMC_FLAG_ZLIB) {
-        PyErr_SetString(PylibMCExc_MemcachedError,
+        PyErr_SetString(PylibMCExc_Error,
             "value for key compressed, unable to inflate");
         return NULL;
     }
@@ -404,22 +521,22 @@ static PyObject *_PylibMC_parse_memcached_value(char *value, size_t size,
             /* PyInt_FromString doesn't take a length param and we're
                not NULL-terminated, so we'll have to make an
                intermediate Python string out of it */
-            tmp = PyString_FromStringAndSize(value, size);
+            tmp = PyBytes_FromStringAndSize(value, size);
             if(tmp == NULL) {
               goto cleanup;
             }
-            retval = PyInt_FromString(PyString_AS_STRING(tmp), NULL, 10);
+            retval = PyLong_FromString(PyBytes_AS_STRING(tmp), NULL, 10);
             if(retval != NULL && dtype == PYLIBMC_FLAG_BOOL) {
               Py_DECREF(tmp);
               tmp = retval;
-              retval = PyBool_FromLong(PyInt_AS_LONG(tmp));
+              retval = PyBool_FromLong(PyLong_AS_LONG(tmp));
             }
             break;
         case PYLIBMC_FLAG_NONE:
-            retval = PyString_FromStringAndSize(value, (Py_ssize_t)size);
+            retval = PyBytes_FromStringAndSize(value, (Py_ssize_t)size);
             break;
         default:
-            PyErr_Format(PylibMCExc_MemcachedError,
+            PyErr_Format(PylibMCExc_Error,
                     "unknown memcached key flags %u", flags);
     }
 
@@ -446,7 +563,7 @@ static PyObject *PylibMC_Client_get(PylibMC_Client *self, PyObject *arg) {
     uint32_t flags;
     memcached_return error;
 
-    if (!_PylibMC_CheckKey(arg)) {
+    if (!_key_normalized_obj(&arg)) {
         return NULL;
     } else if (!PySequence_Length(arg) ) {
         /* Others do this, so... */
@@ -455,7 +572,7 @@ static PyObject *PylibMC_Client_get(PylibMC_Client *self, PyObject *arg) {
 
     Py_BEGIN_ALLOW_THREADS;
     mc_val = memcached_get(self->mc,
-            PyString_AS_STRING(arg), PyString_GET_SIZE(arg),
+            PyBytes_AS_STRING(arg), PyBytes_GET_SIZE(arg),
             &val_size, &flags, &error);
     Py_END_ALLOW_THREADS;
 
@@ -465,7 +582,7 @@ static PyObject *PylibMC_Client_get(PylibMC_Client *self, PyObject *arg) {
         return r;
     } else if (error == MEMCACHED_SUCCESS) {
         /* This happens for empty values, and so we fake an empty string. */
-        return PyString_FromStringAndSize("", 0);
+        return PyBytes_FromStringAndSize("", 0);
     } else if (error == MEMCACHED_NOTFOUND) {
         /* Since python-memcache returns None when the key doesn't exist,
          * so shall we. */
@@ -473,8 +590,8 @@ static PyObject *PylibMC_Client_get(PylibMC_Client *self, PyObject *arg) {
     }
 
     return PylibMC_ErrFromMemcachedWithKey(self, "memcached_get", error,
-                                           PyString_AS_STRING(arg),
-                                           PyString_GET_SIZE(arg));
+                                           PyBytes_AS_STRING(arg),
+                                           PyBytes_GET_SIZE(arg));
 }
 
 static PyObject *PylibMC_Client_gets(PylibMC_Client *self, PyObject *arg) {
@@ -484,7 +601,7 @@ static PyObject *PylibMC_Client_gets(PylibMC_Client *self, PyObject *arg) {
     memcached_return rc;
     PyObject* ret = NULL;
 
-    if (!_PylibMC_CheckKey(arg)) {
+    if (!_key_normalized_obj(&arg)) {
         return NULL;
     } else if (!PySequence_Length(arg)) {
         return Py_BuildValue("(OO)", Py_None, Py_None);
@@ -496,8 +613,8 @@ static PyObject *PylibMC_Client_gets(PylibMC_Client *self, PyObject *arg) {
     /* Use an mget to fetch the key.
      * mget is the only function that returns a memcached_result_st,
      * which is the only way to get at the returned cas value. */
-    *keys = PyString_AS_STRING(arg);
-    *keylengths = (size_t)PyString_GET_SIZE(arg);
+    *keys = PyBytes_AS_STRING(arg);
+    *keylengths = (size_t)PyBytes_GET_SIZE(arg);
 
     Py_BEGIN_ALLOW_THREADS;
 
@@ -536,14 +653,15 @@ static PyObject *PylibMC_Client_gets(PylibMC_Client *self, PyObject *arg) {
 static PyObject *PylibMC_Client_hash(PylibMC_Client *self, PyObject *args, PyObject *kwds) {
     char *key;
     Py_ssize_t key_len = 0;
+    uint32_t h;
 
     if (!PyArg_ParseTuple(args, "s#:hash", &key, &key_len)) {
         return NULL;
     }
 
-    uint32_t h = memcached_generate_hash(self->mc, key, (size_t)key_len);
+    h = memcached_generate_hash(self->mc, key, (size_t)key_len);
 
-    return PyInt_FromLong((long)h);
+    return PyLong_FromLong((long)h);
 }
 
 /* {{{ Set commands (set, replace, add, prepend, append) */
@@ -551,27 +669,54 @@ static PyObject *_PylibMC_RunSetCommandSingle(PylibMC_Client *self,
         _PylibMC_SetCommand f, char *fname, PyObject *args,
         PyObject *kwds) {
     /* function called by the set/add/etc commands */
-    static char *kws[] = { "key", "val", "time", "min_compress_len", NULL };
+    static char *kws[] = { "key", "val", "time",
+                           "min_compress_len", "compress_level",
+                           NULL };
+    const char *key_raw;
     PyObject *key;
+    Py_ssize_t keylen;
     PyObject *value;
+    pylibmc_mset serialized = { NULL };
     unsigned int time = 0; /* this will be turned into a time_t */
     unsigned int min_compress = 0;
+    int compress_level = -1;
+
     bool success = false;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "SO|II", kws,
-                                     &key, &value,
-                                     &time, &min_compress)) {
+    /*
+     * "s#" specifies that (Unicode) text objects will be encoded
+     * to UTF-8 byte strings for use as keys, and this seems to be
+     * the only sensible thing to do when the user attempts this
+     */
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "s#O|IIi", kws,
+                                     &key_raw, &keylen, &value,
+                                     &time, &min_compress, &compress_level)) {
       return NULL;
     }
 
-#ifndef USE_ZLIB
+#ifdef USE_ZLIB
+    if (compress_level == -1) {
+        compress_level = Z_DEFAULT_COMPRESSION;
+    } else if (compress_level < 0 || compress_level > 9) {
+        PyErr_SetString(PyExc_ValueError, "compress_level must be between 0 and 9 inclusive");
+        return NULL;
+    }
+#else
     if (min_compress) {
       PyErr_SetString(PyExc_TypeError, "min_compress_len without zlib");
       return NULL;
     }
 #endif
 
-    pylibmc_mset serialized = { NULL };
+
+
+    /*
+    Kind of clumsy to convert to a char* and then to a Python
+    bytes object, but using "s#" for argument parsing seems to
+    be the cleanest way to accept both byte strings and text
+    strings as keys.
+     */
+    key = PyBytes_FromStringAndSize(key_raw, keylen);
 
     success = _PylibMC_SerializeValue(key, NULL, value, time, &serialized);
 
@@ -580,10 +725,11 @@ static PyObject *_PylibMC_RunSetCommandSingle(PylibMC_Client *self,
 
     success = _PylibMC_RunSetCommand(self, f, fname,
                                      &serialized, 1,
-                                     min_compress);
+                                     min_compress, compress_level);
 
 cleanup:
     _PylibMC_FreeMset(&serialized);
+    Py_DECREF(key);
 
     if(PyErr_Occurred() != NULL) {
         return NULL;
@@ -599,32 +745,48 @@ static PyObject *_PylibMC_RunSetCommandMulti(PylibMC_Client *self,
         PyObject *kwds) {
     /* function called by the set/add/incr/etc commands */
     PyObject *keys = NULL;
+    const char *key_prefix_raw = NULL;
+    Py_ssize_t key_prefix_len = 0;
     PyObject *key_prefix = NULL;
     unsigned int time = 0;
     unsigned int min_compress = 0;
+    int compress_level = -1;
     PyObject *retval = NULL;
     size_t idx = 0;
+    PyObject *curr_key, *curr_value;
+    Py_ssize_t pos;
+    size_t nkeys;
+    pylibmc_mset* serialized;
+    bool allsuccess;
 
-    static char *kws[] = { "keys", "time", "key_prefix", "min_compress_len", NULL };
+    static char *kws[] = { "keys", "time", "key_prefix",
+                           "min_compress_len", "compress_level",
+                           NULL };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!|ISI", kws,
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!|Is#Ii", kws,
                                      &PyDict_Type, &keys,
-                                     &time, &key_prefix,
-                                     &min_compress)) {
+                                     &time, &key_prefix_raw, &key_prefix_len,
+                                     &min_compress, &compress_level)) {
         return NULL;
     }
 
-#ifndef USE_ZLIB
-    if (min_compress) {
-        PyErr_SetString(PyExc_TypeError, "min_compress_len without zlib");
+#ifdef USE_ZLIB
+    if (compress_level == -1) {
+        compress_level = Z_DEFAULT_COMPRESSION;
+    } else if (compress_level < 0 || compress_level > 9) {
+        PyErr_SetString(PyExc_ValueError, "compress_level must be between 0 and 9 inclusive");
         return NULL;
+    }
+#else
+    if (min_compress) {
+      PyErr_SetString(PyExc_TypeError, "min_compress_len without zlib");
+      return NULL;
     }
 #endif
 
-    PyObject *curr_key, *curr_value;
-    size_t nkeys = (size_t)PyDict_Size(keys);
+    nkeys = (size_t)PyDict_Size(keys);
 
-    pylibmc_mset* serialized = PyMem_New(pylibmc_mset, nkeys);
+    serialized = PyMem_New(pylibmc_mset, nkeys);
     if (serialized == NULL) {
         goto cleanup;
     }
@@ -640,7 +802,11 @@ static PyObject *_PylibMC_RunSetCommandMulti(PylibMC_Client *self,
      * this is safe because Python strings are immutable
      */
 
-    Py_ssize_t pos = 0; /* PyDict_Next's 'pos' isn't an incrementing index */
+    pos = 0; /* PyDict_Next's 'pos' isn't an incrementing index */
+
+    if (key_prefix_raw != NULL) {
+        key_prefix = PyBytes_FromStringAndSize(key_prefix_raw, key_prefix_len);
+    }
 
     for (idx = 0; PyDict_Next(keys, &pos, &curr_key, &curr_value); idx++) {
         int success = _PylibMC_SerializeValue(curr_key, key_prefix,
@@ -660,9 +826,9 @@ static PyObject *_PylibMC_RunSetCommandMulti(PylibMC_Client *self,
         goto cleanup;
     }
 
-    bool allsuccess = _PylibMC_RunSetCommand(self, f, fname,
+    allsuccess = _PylibMC_RunSetCommand(self, f, fname,
                                              serialized, nkeys,
-                                             min_compress);
+                                             min_compress, compress_level);
 
     if (PyErr_Occurred() != NULL) {
         goto cleanup;
@@ -692,6 +858,7 @@ cleanup:
         }
         PyMem_Free(serialized);
     }
+    Py_XDECREF(key_prefix);
 
     return retval;
 }
@@ -701,15 +868,18 @@ static PyObject *_PylibMC_RunCasCommand(PylibMC_Client *self,
     /* function called by the set/add/etc commands */
     static char *kws[] = { "key", "val", "cas", "time", NULL };
     PyObject *ret = NULL;
+    const char *key_raw;
+    Py_ssize_t key_len;
     PyObject *key;
     PyObject *value;
     uint64_t cas = 0;
     unsigned int time = 0; /* this will be turned into a time_t */
     bool success = false;
     memcached_return rc;
+    pylibmc_mset mset = { NULL };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "SOL|I", kws,
-                                     &key, &value, &cas,
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "s#OL|I", kws,
+                                     &key_raw, &key_len, &value, &cas,
                                      &time)) {
       return NULL;
     }
@@ -719,7 +889,7 @@ static PyObject *_PylibMC_RunCasCommand(PylibMC_Client *self,
       return NULL;
     }
 
-    pylibmc_mset mset = { NULL };
+    key = PyBytes_FromStringAndSize(key_raw, key_len);
 
     /* TODO: because it's RunSetCommand that does the zlib
        compression, cas can't currently use compressed values. */
@@ -752,6 +922,7 @@ static PyObject *_PylibMC_RunCasCommand(PylibMC_Client *self,
 
 cleanup:
     _PylibMC_FreeMset(&mset);
+    Py_DECREF(key);
 
     return ret;
 }
@@ -773,6 +944,8 @@ static int _PylibMC_SerializeValue(PyObject* key_obj,
                                    PyObject* value_obj,
                                    time_t time,
                                    pylibmc_mset* serialized) {
+    PyObject* store_val = NULL;
+
     /* first zero the whole structure out */
     memset((void *)serialized, 0x0, sizeof(pylibmc_mset));
 
@@ -780,26 +953,26 @@ static int _PylibMC_SerializeValue(PyObject* key_obj,
     serialized->success = false;
     serialized->flags = PYLIBMC_FLAG_NONE;
 
-    if(!_PylibMC_CheckKey(key_obj)
-       || PyString_AsStringAndSize(key_obj, &serialized->key,
+    if(!_key_normalized_obj(&key_obj)
+       || PyBytes_AsStringAndSize(key_obj, &serialized->key,
                                    &serialized->key_len) == -1) {
         return false;
     }
 
     /* We need to incr our reference here so that it's guaranteed to
        exist while we release the GIL. Even if we fail after this it
-       should be decremeneted by pylib_mset_free */
+       should be decremented by pylibmc_mset_free */
     Py_INCREF(key_obj);
     serialized->key_obj = key_obj;
 
     /* Check the key_prefix */
     if (key_prefix != NULL) {
-        if (!_PylibMC_CheckKey(key_prefix)) {
+        if (!_key_normalized_obj(&key_prefix)) {
             return false;
         }
 
         /* Ignore empty prefixes */
-        if (!PyString_Size(key_prefix)) {
+        if (!PyBytes_Size(key_prefix)) {
             key_prefix = NULL;
         }
     }
@@ -808,17 +981,17 @@ static int _PylibMC_SerializeValue(PyObject* key_obj,
     if (key_prefix != NULL) {
         PyObject* prefixed_key_obj = NULL; /* freed by _PylibMC_FreeMset */
 
-        prefixed_key_obj = PyString_FromFormat("%s%s",
-                PyString_AS_STRING(key_prefix),
-                PyString_AS_STRING(key_obj));
+        prefixed_key_obj = PyBytes_FromFormat("%s%s",
+                PyBytes_AS_STRING(key_prefix),
+                PyBytes_AS_STRING(key_obj));
 
         if(prefixed_key_obj == NULL) {
             return false;
         }
 
         /* check the key and overwrite the C string */
-        if(!_PylibMC_CheckKey(prefixed_key_obj)
-           || PyString_AsStringAndSize(prefixed_key_obj,
+        if(!_key_normalized_obj(&prefixed_key_obj)
+           || PyBytes_AsStringAndSize(prefixed_key_obj,
                                        &serialized->key,
                                        &serialized->key_len) == -1) {
             Py_DECREF(prefixed_key_obj);
@@ -830,29 +1003,38 @@ static int _PylibMC_SerializeValue(PyObject* key_obj,
 
     /* Key/key_size should be harmonized, now onto the value */
 
-    PyObject* store_val = NULL;
+
 
     /* First build store_val, a Python String object, out of the object
        we were passed */
-    if (PyString_Check(value_obj)) {
+    if (PyBytes_Check(value_obj)) {
         store_val = value_obj;
         Py_INCREF(store_val); /* because we'll be decring it again in
                                  pylibmc_mset_free*/
+#if PY_MAJOR_VERSION >= 3
     } else if (PyBool_Check(value_obj)) {
         serialized->flags |= PYLIBMC_FLAG_BOOL;
-        PyObject* tmp = PyNumber_Int(value_obj);
-        store_val = PyObject_Str(tmp);
+        store_val = PyBytes_FromFormat("%ld", PyLong_AsLong(value_obj));
+    } else if (PyLong_Check(value_obj)) {
+        serialized->flags |= PYLIBMC_FLAG_LONG;
+        store_val = PyBytes_FromFormat("%ld", PyLong_AsLong(value_obj));
+#else
+    } else if (PyBool_Check(value_obj)) {
+        serialized->flags |= PYLIBMC_FLAG_BOOL;
+        PyObject* tmp = PyNumber_Long(value_obj);
+        store_val = PyObject_Bytes(tmp);
         Py_DECREF(tmp);
     } else if (PyInt_Check(value_obj)) {
         serialized->flags |= PYLIBMC_FLAG_INTEGER;
         PyObject* tmp = PyNumber_Int(value_obj);
-        store_val = PyObject_Str(tmp);
+        store_val = PyObject_Bytes(tmp);
         Py_DECREF(tmp);
     } else if (PyLong_Check(value_obj)) {
         serialized->flags |= PYLIBMC_FLAG_LONG;
         PyObject* tmp = PyNumber_Long(value_obj);
-        store_val = PyObject_Str(tmp);
+        store_val = PyObject_Bytes(tmp);
         Py_DECREF(tmp);
+#endif
     } else if(value_obj != NULL) {
         /* we have no idea what it is, so we'll store it pickled */
         Py_INCREF(value_obj);
@@ -865,7 +1047,7 @@ static int _PylibMC_SerializeValue(PyObject* key_obj,
         return false;
     }
 
-    if (PyString_AsStringAndSize(store_val, &serialized->value,
+    if (PyBytes_AsStringAndSize(store_val, &serialized->value,
                                  &serialized->value_len) == -1) {
         if (serialized->flags == PYLIBMC_FLAG_NONE) {
             /* For some reason we weren't able to extract the value/size
@@ -889,7 +1071,8 @@ static int _PylibMC_SerializeValue(PyObject* key_obj,
 static bool _PylibMC_RunSetCommand(PylibMC_Client* self,
                                    _PylibMC_SetCommand f, char *fname,
                                    pylibmc_mset* msets, size_t nkeys,
-                                   size_t min_compress) {
+                                   size_t min_compress,
+                                   int compress_level) {
     memcached_st *mc = self->mc;
     memcached_return rc = MEMCACHED_SUCCESS;
     int pos;
@@ -909,11 +1092,10 @@ static bool _PylibMC_RunSetCommand(PylibMC_Client* self,
         char *compressed_value = NULL;
         size_t compressed_len = 0;
 
-        if (min_compress && value_len >= min_compress) {
-            Py_BLOCK_THREADS;
+        if (compress_level && min_compress && value_len >= min_compress) {
             _PylibMC_Deflate(value, value_len,
-                             &compressed_value, &compressed_len);
-            Py_UNBLOCK_THREADS;
+                             &compressed_value, &compressed_len,
+                             compress_level);
         }
 
         if (compressed_value != NULL) {
@@ -1019,7 +1201,7 @@ static PyObject *PylibMC_Client_delete(PylibMC_Client *self, PyObject *args) {
     memcached_return rc;
 
     if (PyArg_ParseTuple(args, "s#:delete", &key, &key_len)
-            && _PylibMC_CheckKeyStringAndSize(key, key_len)) {
+            && _key_normalized_str(&key, &key_len)) {
         Py_BEGIN_ALLOW_THREADS;
         rc = memcached_delete(self->mc, key, key_len, 0);
         Py_END_ALLOW_THREADS;
@@ -1041,12 +1223,14 @@ static PyObject *PylibMC_Client_delete(PylibMC_Client *self, PyObject *args) {
 }
 
 static PyObject *PylibMC_Client_touch(PylibMC_Client *self, PyObject *args) {
+#if LIBMEMCACHED_VERSION_HEX >= 0x01000002
     char *key;
     long seconds;
-    int key_len;
+    Py_ssize_t key_len;
     memcached_return rc;
 
-    if(PyArg_ParseTuple(args, "s#k", &key, &key_len, &seconds) && _PylibMC_CheckKeyStringAndSize(key, key_len)) {
+    if(PyArg_ParseTuple(args, "s#k", &key, &key_len, &seconds)
+            && _key_normalized_str(&key, &key_len)) {
         Py_BEGIN_ALLOW_THREADS;
         rc = memcached_touch(self->mc, key, key_len, seconds);
         Py_END_ALLOW_THREADS;
@@ -1066,7 +1250,13 @@ static PyObject *PylibMC_Client_touch(PylibMC_Client *self, PyObject *args) {
     }
 
     return NULL;
+#else
+    PyErr_Format(PylibMCExc_Error,
+                 "memcached_touch isn't available; upgrade libmemcached to >= 1.0.2");
+    return NULL;
+#endif
 }
+
 
 
 /* {{{ Increment & decrement */
@@ -1076,10 +1266,11 @@ static PyObject *_PylibMC_IncrSingle(PylibMC_Client *self,
     char *key;
     Py_ssize_t key_len = 0;
     int delta = 1;
+    pylibmc_incr incr;
 
     if (!PyArg_ParseTuple(args, "s#|i", &key, &key_len, &delta)) {
         return NULL;
-    } else if (!_PylibMC_CheckKeyStringAndSize(key, key_len)) {
+    } else if (!_key_normalized_str(&key, &key_len)) {
         return NULL;
     }
 
@@ -1093,9 +1284,11 @@ static PyObject *_PylibMC_IncrSingle(PylibMC_Client *self,
         return NULL;
     }
 
-    pylibmc_incr incr = { key, key_len,
-                          incr_func, delta,
-                          0 };
+    incr.key = key;
+    incr.key_len = key_len;
+    incr.incr_func = incr_func;
+    incr.delta = delta;
+    incr.result = 0;
 
     _PylibMC_IncrDecr(self, &incr, 1);
 
@@ -1114,27 +1307,30 @@ static PyObject *_PylibMC_IncrMulti(PylibMC_Client *self,
     PyObject *key = NULL;
     PyObject *keys = NULL;
     PyObject *keys_tmp = NULL;
+    const char *key_prefix_raw = NULL;
+    Py_ssize_t key_prefix_len = 0;
     PyObject *key_prefix = NULL;
     PyObject *retval = NULL;
     PyObject *iterator = NULL;
     unsigned int delta = 1;
     size_t nkeys = 0, i = 0;
+    pylibmc_incr *incrs;
 
     static char *kws[] = { "keys", "key_prefix", "delta", NULL };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|SI", kws,
-                                     &keys, &key_prefix, &delta))
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|s#I", kws,
+                                     &keys, &key_prefix_raw,
+                                     &key_prefix_len, &delta))
         return NULL;
 
     nkeys = (size_t)PySequence_Size(keys);
     if (nkeys == -1)
         return NULL;
 
-    if (key_prefix != NULL) {
-        if (!_PylibMC_CheckKey(key_prefix))
-            return NULL;
+    if (key_prefix_raw != NULL) {
+        key_prefix = PyBytes_FromStringAndSize(key_prefix_raw, key_prefix_len);
 
-        if (PyString_Size(key_prefix) == 0)
+        if (key_prefix != NULL && PyBytes_Size(key_prefix) == 0)
             key_prefix = NULL;
     }
 
@@ -1142,7 +1338,7 @@ static PyObject *_PylibMC_IncrMulti(PylibMC_Client *self,
     if (keys_tmp == NULL)
         return NULL;
 
-    pylibmc_incr *incrs = PyMem_New(pylibmc_incr, nkeys);
+    incrs = PyMem_New(pylibmc_incr, nkeys);
     if (incrs == NULL)
         goto cleanup;
 
@@ -1154,14 +1350,14 @@ static PyObject *_PylibMC_IncrMulti(PylibMC_Client *self,
     for (i = 0; (key = PyIter_Next(iterator)) != NULL; i++) {
         pylibmc_incr *incr = incrs + i;
 
-        if (!_PylibMC_CheckKey(key))
+        if (!_key_normalized_obj(&key))
             goto loopcleanup;
 
         /* prefix `key` with `key_prefix` */
         if (key_prefix != NULL) {
-            PyObject* newkey = PyString_FromFormat("%s%s",
-                                                   PyString_AS_STRING(key_prefix),
-                                                   PyString_AS_STRING(key));
+            PyObject* newkey = PyBytes_FromFormat("%s%s",
+                                                   PyBytes_AS_STRING(key_prefix),
+                                                   PyBytes_AS_STRING(key));
             Py_DECREF(key);
             key = newkey;
         }
@@ -1171,7 +1367,7 @@ static PyObject *_PylibMC_IncrMulti(PylibMC_Client *self,
             goto loopcleanup;
 
         /* Populate pylibmc_incr */
-        if (PyString_AsStringAndSize(key, &incr->key, &incr->key_len) == -1)
+        if (PyBytes_AsStringAndSize(key, &incr->key, &incr->key_len) == -1)
             goto loopcleanup;
         incr->delta = delta;
         incr->incr_func = incr_func;
@@ -1199,6 +1395,7 @@ loopcleanup:
 cleanup:
     if (incrs != NULL)
         PyMem_Free(incrs);
+    Py_XDECREF(key_prefix);
     Py_DECREF(keys_tmp);
     Py_XDECREF(iterator);
 
@@ -1243,7 +1440,7 @@ static bool _PylibMC_IncrDecr(PylibMC_Client *self,
     Py_END_ALLOW_THREADS;
 
     if (errors + notfound) {
-        PyObject *exc = PylibMCExc_MemcachedError;
+        PyObject *exc = PylibMCExc_Error;
 
         if (errors == 0)
             exc = _exc_by_rc(MEMCACHED_NOTFOUND);
@@ -1338,6 +1535,7 @@ static PyObject *PylibMC_Client_get_multi(
     size_t *key_lens;
     size_t nkeys, nresults = 0;
     memcached_return rc;
+    pylibmc_mget_req req;
 
     static char *kws[] = { "keys", "key_prefix", NULL };
 
@@ -1373,12 +1571,12 @@ static PyObject *PylibMC_Client_get_multi(
 
         assert(i < nkeys);
 
-        if (PyErr_Occurred() || !_PylibMC_CheckKey(ckey)) {
+        if (PyErr_Occurred() || !_key_normalized_obj(&ckey)) {
             nkeys = i;
             goto earlybird;
         }
 
-        PyString_AsStringAndSize(ckey, &key, &key_len);
+        PyBytes_AsStringAndSize(ckey, &key, &key_len);
 
         key_lens[i] = (size_t)(key_len + prefix_len);
 
@@ -1390,20 +1588,20 @@ static PyObject *PylibMC_Client_get_multi(
 
         /* determine rkey, the prefixed ckey */
         if (prefix != NULL) {
-            rkey = PyString_FromStringAndSize(prefix, prefix_len);
-            PyString_Concat(&rkey, ckey);
+            rkey = PyBytes_FromStringAndSize(prefix, prefix_len);
+            PyBytes_Concat(&rkey, ckey);
             if (rkey == NULL)
                 goto earlybird;
             Py_DECREF(rkey);
-            rkey = PyString_FromFormat("%s%s",
-                    prefix, PyString_AS_STRING(ckey));
+            rkey = PyBytes_FromFormat("%s%s",
+                    prefix, PyBytes_AS_STRING(ckey));
         } else {
             Py_INCREF(ckey);
             rkey = ckey;
         }
         Py_DECREF(ckey);
 
-        keys[i] = PyString_AS_STRING(rkey);
+        keys[i] = PyBytes_AS_STRING(rkey);
         key_objs[i++] = rkey;
     }
     nkeys = i;
@@ -1425,7 +1623,12 @@ static PyObject *PylibMC_Client_get_multi(
      */
     Py_BEGIN_ALLOW_THREADS;
 
-    pylibmc_mget_req req = { keys, nkeys, key_lens, &results, &nresults, &err_func };
+    req.keys = keys;
+    req.nkeys = nkeys;
+    req.key_lens = key_lens;
+    req.results = &results;
+    req.nresults = &nresults;
+    req.err_func = &err_func;
     rc = pylibmc_memcached_fetch_multi(self->mc, req);
 
     Py_END_ALLOW_THREADS;
@@ -1444,7 +1647,7 @@ static PyObject *PylibMC_Client_get_multi(
         res = results + i;
 
         /* Long-winded, but this way we can handle NUL-bytes in keys. */
-        key_obj = PyString_FromStringAndSize(memcached_result_key_value(res) + prefix_len,
+        key_obj = PyBytes_FromStringAndSize(memcached_result_key_value(res) + prefix_len,
                                              memcached_result_key_length(res) - prefix_len);
         if (key_obj == NULL)
             goto unpack_error;
@@ -1502,7 +1705,7 @@ static PyObject *_PylibMC_DoMulti(PyObject *values, PyObject *func,
     PyObject *retval = PyList_New(0);
     PyObject *iter = NULL;
     PyObject *item = NULL;
-    int is_mapping = PyMapping_Check(values);
+    int is_mapping = PyDict_Check(values);
 
     if (retval == NULL)
         goto error;
@@ -1516,7 +1719,14 @@ static PyObject *_PylibMC_DoMulti(PyObject *values, PyObject *func,
         PyObject *key = NULL;
         PyObject *ro = NULL;
 
-        /* Calculate key. */
+        /**
+         * Calculate key.
+         *
+         * prefix is already converted to a byte string, so ensure that
+         * the key is of the same type before trying to append.
+         */
+        if (!_key_normalized_obj(&item))
+            goto iter_error;
         if (prefix == NULL || prefix == Py_None) {
             /* We now have two owned references to item. */
             key = item;
@@ -1524,13 +1734,17 @@ static PyObject *_PylibMC_DoMulti(PyObject *values, PyObject *func,
         } else {
             key = PySequence_Concat(prefix, item);
         }
-        if (key == NULL || !_PylibMC_CheckKey(key))
+        /**
+         * Another call to _key_normalized_obj is still a good idea since
+         * we might have created a key that's too long
+         */
+        if (key == NULL || !_key_normalized_obj(&key))
             goto iter_error;
 
         /* Calculate args. */
         if (is_mapping) {
             PyObject *value;
-            char *key_str = PyString_AS_STRING(item);
+            char *key_str = PyBytes_AS_STRING(item);
 
             if ((value = PyMapping_GetItemString(values, key_str)) == NULL)
                 goto iter_error;
@@ -1598,6 +1812,8 @@ static PyObject *PylibMC_Client_add_multi(PylibMC_Client *self, PyObject *args,
 
 static PyObject *PylibMC_Client_delete_multi(PylibMC_Client *self,
         PyObject *args, PyObject *kwds) {
+    const char *prefix_raw = NULL;
+    Py_ssize_t prefix_len;
     PyObject *prefix = NULL;
     PyObject *time = NULL;
     PyObject *delete;
@@ -1607,8 +1823,8 @@ static PyObject *PylibMC_Client_delete_multi(PylibMC_Client *self,
 
     static char *kws[] = { "keys", "key_prefix", NULL };
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|S:delete_multi", kws,
-                                     &keys, &prefix))
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|s#:delete_multi", kws,
+                                     &keys, &prefix_raw, &prefix_len))
         return NULL;
 
     /**
@@ -1622,10 +1838,25 @@ static PyObject *PylibMC_Client_delete_multi(PylibMC_Client *self,
      *      delete("a", 1, 3)
      *      delete("b", 2, 3)
      */
+#if PY_MAJOR_VERSION >= 3
+    /*
+     * This isn't optimal, but PyMapping_Check returns 1 for
+     * tuples, lists and other sequences in Python 3. According to
+     * http://bugs.python.org/issue5945 PyMapping_Check has never
+     * been particularly reliable, so hopefully it's enough to
+     * check for dict objects (and subclasses) specifically.
+     */
+    if (PyDict_Check(keys)) {
+#else
     if (PyMapping_Check(keys)) {
+#endif
         PyErr_SetString(PyExc_TypeError,
             "keys must be a sequence, not a mapping");
         return NULL;
+    }
+
+    if (prefix_raw != NULL) {
+        prefix = PyBytes_FromStringAndSize(prefix_raw, prefix_len);
     }
 
     if ((delete = PyObject_GetAttrString((PyObject *)self, "delete")) == NULL)
@@ -1640,6 +1871,7 @@ static PyObject *PylibMC_Client_delete_multi(PylibMC_Client *self,
         Py_DECREF(call_args);
     }
     Py_DECREF(delete);
+    Py_XDECREF(prefix);
 
     if (retval == NULL)
         return NULL;
@@ -1671,7 +1903,7 @@ static PyObject *PylibMC_Client_get_behaviors(PylibMC_Client *self) {
         PyObject *x;
 
         bval = memcached_behavior_get(self->mc, b->flag);
-        x = PyInt_FromLong((long)bval);
+        x = PyLong_FromLong((long)bval);
         if (x == NULL || PyDict_SetItemString(retval, b->name, x) == -1) {
             Py_XDECREF(x);
             goto error;
@@ -1699,17 +1931,18 @@ static PyObject *PylibMC_Client_set_behaviors(PylibMC_Client *self,
             continue;
         } else if ((py_v = PyMapping_GetItemString(behaviors, b->name)) == NULL) {
             goto error;
-        } else if (!PyInt_Check(py_v)) {
-            PyErr_Format(PyExc_TypeError, "behavior %.32s must be int", b->name);
+        } else if (!(PyInt_Check(py_v) || PyLong_Check(py_v) || PyBool_Check(py_v))) {
+            PyErr_Format(PyExc_TypeError, "behavior %.32s must be int, not %s",
+                b->name, Py_TYPE(py_v)->tp_name);
             goto error;
         }
 
-        v = (uint64_t)PyInt_AS_LONG(py_v);
+        v = (uint64_t)PyLong_AS_LONG(py_v);
         Py_DECREF(py_v);
 
         r = memcached_behavior_set(self->mc, b->flag, v);
         if (r != MEMCACHED_SUCCESS) {
-            PyErr_Format(PylibMCExc_MemcachedError,
+            PyErr_Format(PylibMCExc_Error,
                          "memcached_behavior_set returned %d for "
                          "behavior '%.32s' = %u", r, b->name, (unsigned int)v);
             goto error;
@@ -1723,7 +1956,7 @@ static PyObject *PylibMC_Client_set_behaviors(PylibMC_Client *self,
             goto error;
         }
 
-        key = PyString_AS_STRING(py_v);
+        key = PyBytes_AS_STRING(py_v);
 
         r = memcached_callback_set(self->mc, b->flag, key);
 
@@ -1731,7 +1964,7 @@ static PyObject *PylibMC_Client_set_behaviors(PylibMC_Client *self,
             PyErr_Format(PyExc_ValueError, "bad key provided: %s", key);
             goto error;
         } else if (r != MEMCACHED_SUCCESS) {
-            PyErr_Format(PylibMCExc_MemcachedError,
+            PyErr_Format(PylibMCExc_Error,
                          "memcached_callback_set returned %d for "
                          "callback '%.32s' = %.32s", r, b->name, key);
             goto error;
@@ -1745,7 +1978,9 @@ error:
 
 static memcached_return
 _PylibMC_AddServerCallback(memcached_st *mc,
-#if LIBMEMCACHED_VERSION_HEX >= 0x00039000
+#if LIBMEMCACHED_VERSION_HEX >= 0x01000017
+                           memcached_instance_st* instance,
+#elif LIBMEMCACHED_VERSION_HEX >= 0x00039000
                            memcached_server_instance_st instance,
 #else
                            memcached_server_st *server,
@@ -1779,7 +2014,7 @@ _PylibMC_AddServerCallback(memcached_st *mc,
             goto error;
         }
 
-        curr_value = PyString_FromString(mc_val);
+        curr_value = PyBytes_FromString(mc_val);
         free(mc_val);
         if (curr_value == NULL)
             goto error;
@@ -1792,8 +2027,8 @@ _PylibMC_AddServerCallback(memcached_st *mc,
 
     free(stat_keys);
 
-    desc = PyString_FromFormat("%s:%d (%u)",
-#if LIBMEMCACHED_VERSION_HEX >= 0x00039000 
+    desc = PyBytes_FromFormat("%s:%d (%u)",
+#if LIBMEMCACHED_VERSION_HEX >= 0x00039000
             memcached_server_name(instance), memcached_server_port(instance),
 #else /* ver < libmemcached 0.39 */
             server->hostname, server->port,
@@ -1817,6 +2052,11 @@ static PyObject *PylibMC_Client_get_stats(PylibMC_Client *self, PyObject *args) 
     char *mc_args;
     Py_ssize_t nservers;
     _PylibMC_StatsContext context;
+#if LIBMEMCACHED_VERSION_HEX >= 0x00038000
+    memcached_server_function callbacks[] = {
+        (memcached_server_function)_PylibMC_AddServerCallback
+    };
+#endif
 
     mc_args = NULL;
     if (!PyArg_ParseTuple(args, "|s:get_stats", &mc_args))
@@ -1843,10 +2083,6 @@ static PyObject *PylibMC_Client_get_stats(PylibMC_Client *self, PyObject *args) 
     context.index = 0;
 
 #if LIBMEMCACHED_VERSION_HEX >= 0x00038000
-    memcached_server_function callbacks[] = {
-        (memcached_server_function)_PylibMC_AddServerCallback
-    };
-
     rc = memcached_server_cursor(self->mc, callbacks, (void *)&context, 1);
 #else /* ver < libmemcached 0.38 */
     context.servers = memcached_server_list(self->mc);
@@ -1882,11 +2118,11 @@ static PyObject *PylibMC_Client_flush_all(PylibMC_Client *self,
     static char *kws[] = { "time", NULL };
 
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O!:flush_all", kws,
-                                     &PyInt_Type, &time))
+                                     &PyLong_Type, &time))
         return NULL;
 
     if (time != NULL)
-        expire = PyInt_AS_LONG(time);
+        expire = PyLong_AS_LONG(time);
 
     expire = (expire > 0) ? expire : 0;
 
@@ -1911,7 +2147,7 @@ static PyObject *PylibMC_Client_clone(PylibMC_Client *self) {
      * cloned memcached_st for mc. */
     PylibMC_Client *clone;
 
-    clone = (PylibMC_Client *)PyType_GenericNew(self->ob_type, NULL, NULL);
+    clone = (PylibMC_Client *)PyType_GenericNew(Py_TYPE(self), NULL, NULL);
     if (clone == NULL) {
         return NULL;
     }
@@ -1928,7 +2164,7 @@ static PyObject *_exc_by_rc(memcached_return rc) {
     for (err = PylibMCExc_mc_errs; err->name != NULL; err++)
         if (err->rc == rc)
             return err->exc;
-    return (PyObject *)PylibMCExc_MemcachedError;
+    return (PyObject *)PylibMCExc_Error;
 }
 
 static char *_get_lead(memcached_st *mc, char *buf, int n, const char *what,
@@ -1944,7 +2180,7 @@ static char *_get_lead(memcached_st *mc, char *buf, int n, const char *what,
 
 static void _set_error(memcached_st *mc, memcached_return error, char *lead) {
     if (error == MEMCACHED_ERRNO) {
-        PyErr_Format(PylibMCExc_MemcachedError, "%s: %s",
+        PyErr_Format(PylibMCExc_Error, "%s: %s",
                      lead, strerror(errno));
     } else if (error == MEMCACHED_SUCCESS) {
         PyErr_Format(PyExc_RuntimeError, "error == MEMCACHED_SUCCESS");
@@ -2006,7 +2242,11 @@ static PyObject *_PylibMC_Unpickle(const char *buff, size_t size) {
     retval = NULL;
     pickle_load = _PylibMC_GetPickles("loads");
     if (pickle_load != NULL) {
+#if PY_MAJOR_VERSION >= 3
+        retval = PyObject_CallFunction(pickle_load, "y#", buff, size);
+#else
         retval = PyObject_CallFunction(pickle_load, "s#", buff, size);
+#endif
         Py_DECREF(pickle_load);
     }
 
@@ -2027,33 +2267,55 @@ static PyObject *_PylibMC_Pickle(PyObject *val) {
 }
 /* }}} */
 
-static int _PylibMC_CheckKey(PyObject *key) {
-    if (key == NULL) {
+static int _key_normalized_obj(PyObject **key) {
+    int rc;
+    char *key_str;
+    Py_ssize_t key_sz;
+
+    if (*key == NULL) {
         PyErr_SetString(PyExc_ValueError, "key must be given");
         return 0;
-    } else if (!PyString_Check(key)) {
-        PyErr_SetString(PyExc_TypeError, "key must be an instance of str");
+    }
+
+    if (PyUnicode_Check(*key)) {
+        *key = PyUnicode_AsUTF8String(*key);
+        if (*key == NULL)
+            return 0;
+    }
+
+    if (!PyBytes_Check(*key)) {
+        PyErr_SetString(PyExc_TypeError, "key must be bytes");
         return 0;
     }
 
-    return _PylibMC_CheckKeyStringAndSize(
-            PyString_AS_STRING(key), PyString_GET_SIZE(key));
+    key_str = PyBytes_AS_STRING(*key);
+    key_sz = PyBytes_GET_SIZE(*key);
+    rc = _key_normalized_str(&key_str, &key_sz);
+    if (rc == 2) {
+        *key = PyBytes_FromStringAndSize(key_str, key_sz);
+        rc = 1;
+    }
+    return rc;
 }
 
-static int _PylibMC_CheckKeyStringAndSize(char *key, Py_ssize_t size) {
+/**
+ * Normalize memcached key.
+ *
+ * Returns 0 if invalid, 1 if already normalized, and 2 if mutated.
+ */
+static int _key_normalized_str(char **str, Py_ssize_t *size) {
     /* libmemcached pads max_key_size with one byte for null termination */
-    if (size >= MEMCACHED_MAX_KEY) {
-        PyErr_Format(PyExc_ValueError, "key too long, max is %d",
-                MEMCACHED_MAX_KEY - 1);
+    if (*size >= MEMCACHED_MAX_KEY) {
+        PyErr_Format(PyExc_ValueError, "key length %zd too long, max is %d",
+                                       *size, MEMCACHED_MAX_KEY - 1);
         return 0;
-#ifdef NO_EMPTY_KEYS  /* I wish... */
-    } else if (size == 0) {
-        PyErr_Format(PyExc_ValueError, "key cannot be empty");
-#endif
     }
-    /* TODO Check key contents here. */
 
-    return key != NULL;
+    if (*str == NULL) {
+        return 0;
+    }
+
+    return 1;
 }
 
 static int _init_sasl(void) {
@@ -2120,25 +2382,30 @@ static void _make_excs(PyObject *module) {
     PyObject *exc_objs;
     PylibMC_McErr *err;
 
-    PylibMCExc_MemcachedError = PyErr_NewException(
-            "_pylibmc.MemcachedError", NULL, NULL);
+    PylibMCExc_Error = PyErr_NewException(
+            "pylibmc.Error", NULL, NULL);
 
     exc_objs = PyList_New(0);
     PyList_Append(exc_objs,
-        Py_BuildValue("sO", "Error", (PyObject *)PylibMCExc_MemcachedError));
+                  Py_BuildValue("sO", "Error", (PyObject *)PylibMCExc_Error));
 
     for (err = PylibMCExc_mc_errs; err->name != NULL; err++) {
         char excnam[64];
         snprintf(excnam, 64, "_pylibmc.%s", err->name);
-        err->exc = PyErr_NewException(excnam, PylibMCExc_MemcachedError, NULL);
-        PyObject_SetAttrString(err->exc, "retcode", PyInt_FromLong(err->rc));
+        err->exc = PyErr_NewException(excnam, PylibMCExc_Error, NULL);
+        PyObject_SetAttrString(err->exc, "retcode", PyLong_FromLong(err->rc));
         PyModule_AddObject(module, err->name, (PyObject *)err->exc);
         PyList_Append(exc_objs,
-            Py_BuildValue("sO", err->name, (PyObject *)err->exc));
+                      Py_BuildValue("sO", err->name, (PyObject *)err->exc));
     }
 
+    PyModule_AddObject(module, "Error",
+                       (PyObject *)PylibMCExc_Error);
+
+    /* Backwards compatible name for <= pylibmc 1.2.3 */
     PyModule_AddObject(module, "MemcachedError",
-                       (PyObject *)PylibMCExc_MemcachedError);
+                       (PyObject *)PylibMCExc_Error);
+
     PyModule_AddObject(module, "exceptions", exc_objs);
 }
 
@@ -2163,7 +2430,7 @@ static void _make_behavior_consts(PyObject *mod) {
     for (b = PylibMC_callbacks; b->name != NULL; b++) {
         sprintf(name, "callback_%s", b->name);
         PyModule_AddIntConstant(mod, name, b->flag);
-        PyList_Append(names, PyString_FromString(b->name));
+        PyList_Append(names, PyUnicode_FromString(b->name));
     }
 
     PyModule_AddObject(mod, "all_callbacks", names);
@@ -2171,7 +2438,7 @@ static void _make_behavior_consts(PyObject *mod) {
     names = PyList_New(0);
 
     for (b = PylibMC_behaviors; b->name != NULL; b++) {
-        PyList_Append(names, PyString_FromString(b->name));
+        PyList_Append(names, PyUnicode_FromString(b->name));
     }
 
     PyModule_AddObject(mod, "all_behaviors", names);
@@ -2181,21 +2448,10 @@ static PyMethodDef PylibMC_functions[] = {
     {NULL, NULL, 0, NULL}
 };
 
-PyMODINIT_FUNC init_pylibmc(void) {
+MOD_INIT(_pylibmc) {
     PyObject *module;
 
-    if (!_check_libmemcached_version())
-        return;
-
-    if (!_init_sasl())
-        return;
-
-    if (PyType_Ready(&PylibMC_ClientType) < 0) {
-        return;
-    }
-
-    module = Py_InitModule3("_pylibmc", PylibMC_functions,
-            "Hand-made wrapper for libmemcached.\n\
+    MOD_DEF(module, "_pylibmc", "Hand-made wrapper for libmemcached.\n\
 \n\
 You should really use the Python wrapper around this library.\n\
 \n\
@@ -2208,17 +2464,26 @@ no port should be given. libmemcached can parse strings as well::\n\
 \n\
 See libmemcached's memcached_servers_parse for more info on that. I'm told \n\
 you can use UNIX domain sockets by specifying paths, and multiple servers \n\
-by using comma-separation. Good luck with that.\n");
+by using comma-separation. Good luck with that.\n", PylibMC_functions);
+
+    if (!_check_libmemcached_version())
+        return MOD_ERROR_VAL;
+
+    if (!_init_sasl())
+        return MOD_ERROR_VAL;
+
+    if (PyType_Ready(&PylibMC_ClientType) < 0) {
+        return MOD_ERROR_VAL;
+    }
+
     if (module == NULL) {
-        return;
+        return MOD_ERROR_VAL;
     }
 
     _make_excs(module);
 
     PyModule_AddStringConstant(module, "__version__", PYLIBMC_VERSION);
-
     PyModule_ADD_REF(module, "client", (PyObject *)&PylibMC_ClientType);
-
     PyModule_AddStringConstant(module,
             "libmemcached_version", LIBMEMCACHED_VERSION_STRING);
     PyModule_AddIntConstant(module,
@@ -2241,4 +2506,5 @@ by using comma-separation. Good luck with that.\n");
     PyModule_AddIntConstant(module, "server_type_unix", PYLIBMC_SERVER_UNIX);
 
     _make_behavior_consts(module);
+    return MOD_SUCCESS_VAL(module);
 }

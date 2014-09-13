@@ -3,21 +3,21 @@
  *
  * Copyright (c) 2008, Ludvig Ericson
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
- * 
+ *
  *  - Redistributions of source code must retain the above copyright notice,
  *  this list of conditions and the following disclaimer.
- * 
+ *
  *  - Redistributions in binary form must reproduce the above copyright notice,
  *  this list of conditions and the following disclaimer in the documentation
  *  and/or other materials provided with the distribution.
- * 
+ *
  *  - Neither the name of the author nor the names of the contributors may be
  *  used to endorse or promote products derived from this software without
  *  specific prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -70,6 +70,12 @@ typedef ssize_t Py_ssize_t;
                               PYLIBMC_FLAG_LONG | PYLIBMC_FLAG_BOOL)
 /* Modifier flags */
 #define PYLIBMC_FLAG_ZLIB    (1 << 3)
+
+/* Python 3 stuff */
+#ifndef PyVarObject_HEAD_INIT
+#define PyVarObject_HEAD_INIT(type, size)       \
+    PyObject_HEAD_INIT(type) size,
+#endif
 /* }}} */
 
 typedef memcached_return (*_PylibMC_SetCommand)(memcached_st *, const char *,
@@ -124,7 +130,7 @@ typedef struct {
 } _PylibMC_StatsContext;
 
 /* {{{ Exceptions */
-static PyObject *PylibMCExc_MemcachedError;
+static PyObject *PylibMCExc_Error;
 
 /* Mapping of memcached_return value -> Python exception object. */
 typedef struct {
@@ -224,7 +230,11 @@ static PylibMC_Behavior PylibMC_behaviors[] = {
 };
 
 static PylibMC_Behavior PylibMC_callbacks[] = {
+#ifdef MEMCACHED_CALLBACK_NAMESPACE
     { MEMCACHED_CALLBACK_NAMESPACE, "namespace" },
+#else
+    { MEMCACHED_CALLBACK_PREFIX_KEY, "namespace" },
+#endif
     { 0, NULL }
 };
 static PylibMC_Behavior PylibMC_hashers[] = {
@@ -245,11 +255,15 @@ static PylibMC_Behavior PylibMC_hashers[] = {
 static PylibMC_Behavior PylibMC_distributions[] = {
     { MEMCACHED_DISTRIBUTION_MODULA, "modula" },
     { MEMCACHED_DISTRIBUTION_CONSISTENT, "consistent" },
+#if LIBMEMCACHED_VERSION_HEX >= 0x01000000
     { MEMCACHED_DISTRIBUTION_CONSISTENT_WEIGHTED, "consistent_weighted" },
+#endif
     { MEMCACHED_DISTRIBUTION_CONSISTENT_KETAMA, "consistent_ketama" },
     { MEMCACHED_DISTRIBUTION_CONSISTENT_KETAMA_SPY, "consistent_ketama_spy" },
     { MEMCACHED_DISTRIBUTION_RANDOM, "random" },
+#if LIBMEMCACHED_VERSION_HEX >= 0x01000000
     { MEMCACHED_DISTRIBUTION_VIRTUAL_BUCKET, "virtual_bucket" },
+#endif
     { MEMCACHED_DISTRIBUTION_CONSISTENT_MAX, "consistent_max" },
     { 0, NULL }
 };
@@ -297,8 +311,8 @@ static PyObject *PylibMC_ErrFromMemcached(PylibMC_Client *, const char *,
         memcached_return);
 static PyObject *_PylibMC_Unpickle(const char *, size_t);
 static PyObject *_PylibMC_Pickle(PyObject *);
-static int _PylibMC_CheckKey(PyObject *);
-static int _PylibMC_CheckKeyStringAndSize(char *, Py_ssize_t);
+static int _key_normalized_obj(PyObject **);
+static int _key_normalized_str(char **, Py_ssize_t *);
 static int _PylibMC_SerializeValue(PyObject *key_obj,
                                    PyObject *key_prefix,
                                    PyObject *value_obj,
@@ -312,9 +326,14 @@ static PyObject *_PylibMC_RunSetCommandMulti(PylibMC_Client *self,
 static bool _PylibMC_RunSetCommand(PylibMC_Client *self,
                                    _PylibMC_SetCommand f, char *fname,
                                    pylibmc_mset *msets, size_t nkeys,
-                                   size_t min_compress);
+                                   size_t min_compress,
+                                   int compress_level);
 static int _PylibMC_Deflate(char *value, size_t value_len,
-                            char **result, size_t *result_len);
+                            char **result, size_t *result_len,
+                            int compress_level);
+static int _PylibMC_Inflate(char *value, size_t size,
+                            char** result, size_t* result_size,
+                            char** failure_reason);
 static bool _PylibMC_IncrDecr(PylibMC_Client *, pylibmc_incr *, size_t);
 
 /* }}} */
@@ -376,48 +395,45 @@ static PyMethodDef PylibMC_ClientType_methods[] = {
 
 /* {{{ Type def */
 static PyTypeObject PylibMC_ClientType = {
-    PyObject_HEAD_INIT(NULL)
-    0,
-    "client",
-    sizeof(PylibMC_Client),
-    0,
-    (destructor)PylibMC_ClientType_dealloc,
-
-    0,
-    0,
-    0,
-    0,
-    0,
-
-    0,
-    0,
-    0,
-
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-    "memcached client type",
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    PylibMC_ClientType_methods,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    (initproc)PylibMC_Client_init,
-    0,
-    (newfunc)PylibMC_ClientType_new, //PyType_GenericNew,
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "client",                   /* tp_name */
+    sizeof(PylibMC_Client),     /* tp_basicsize */
+    0,                          /* tp_itemsize */
+    (destructor)PylibMC_ClientType_dealloc, /* tp_dealloc */
+    0,                          /* tp_print */
+    0,                          /* tp_getattr */
+    0,                          /* tp_setattr */
+    0,                          /* tp_reserved */
+    0,                          /* tp_repr */
+    0,                          /* tp_as_number */
+    0,                          /* tp_as_sequence */
+    0,                          /* tp_as_mapping */
+    0,                          /* tp_hash  */
+    0,                          /* tp_call */
+    0,                          /* tp_str */
+    0,                          /* tp_getattro */
+    0,                          /* tp_setattro */
+    0,                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT |
+    Py_TPFLAGS_BASETYPE,        /* tp_flags */
+    "memcached client type",    /* tp_doc */
+    0,		                    /* tp_traverse */
+    0,		                    /* tp_clear */
+    0,		                    /* tp_richcompare */
+    0,		                    /* tp_weaklistoffset */
+    0,		                    /* tp_iter */
+    0,		                    /* tp_iternext */
+    PylibMC_ClientType_methods, /* tp_methods */
+    0,                          /* tp_members */
+    0,                          /* tp_getset */
+    0,                          /* tp_base */
+    0,                          /* tp_dict */
+    0,                          /* tp_descr_get */
+    0,                          /* tp_descr_set */
+    0,                          /* tp_dictoffset */
+    (initproc)PylibMC_Client_init,      /* tp_init */
+    0,                          /* tp_alloc */
+    (newfunc)PylibMC_ClientType_new, //PyType_GenericNew,     /* tp_new */
     0,
     0,
     0,
